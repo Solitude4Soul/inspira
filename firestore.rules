@@ -1,0 +1,131 @@
+/**
+ * # Firestore Security Rules
+ *
+ * ## Core Philosophy
+ * This ruleset enforces a strict role-based access control (RBAC) model centered around a global 'admin' role.
+ * Public access is heavily restricted, with notable exceptions for creating documents in the `contact_form_submissions`
+ * and `page_views` collections. All other read and write operations on sensitive data are exclusively reserved
+ * for users designated as administrators.
+ *
+ * ## Data Structure
+ * The data is organized into distinct top-level collections:
+ * - `/roles_admin/{uid}`: Defines who is an administrator. The mere existence of a document here grants admin privileges.
+ * - `/contact_form_submissions/{submissionId}`: Stores user-submitted contact forms. This is a "write-only" collection for the public.
+ * - `/page_views/{viewId}`: Stores page view analytics. This is also a "write-only" collection for the public.
+ * - `/website_configuration/{configId}`: Holds site-wide settings, manageable only by admins.
+ *
+ * ## Key Security Decisions
+ * - **Global Admin Role**: Admin status is determined by checking for the existence of a document at `/roles_admin/{request.auth.uid}`. This is a highly performant and secure way to manage global roles without needing `get()` calls in other rules.
+ * - **Public Write Endpoints**: The `contact_form_submissions` and `page_views` collections are intentionally open for `create` operations to allow public-facing website features to function without requiring user sign-in.
+ * - **Default Deny**: All operations are denied by default. Access is only granted through explicit `allow` statements.
+ * - **Immutability**: Publicly created data (submissions, page views) is immutable after creation; it can be deleted by admins but not updated.
+ * - **No User Listing**: There is no functionality to list users or admins, preventing enumeration attacks.
+ *
+ * ## Denormalization for Authorization
+ * The primary example of this principle is the `/roles_admin` collection. Instead of storing a role field on a user document
+ * and using a slow `get()` call to check it, we use a dedicated collection where the document ID is the user's UID. A fast,
+ * non-billable `exists()` call is all that's needed to verify a user's admin status from any other rule in the system.
+ *
+ * ## Structural Segregation
+ * Data with different access patterns is stored in separate collections. For instance, public-creatable `contact_form_submissions`
+ * and `page_views` are kept separate from admin-only `website_configuration`. This prevents complex rule logic and ensures that a `list` operation on one collection cannot accidentally leak data from another.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------------
+    // Helper Functions
+    // ------------------------------------------------------------------------
+
+    /**
+     * Checks if the user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Checks if the authenticated user is a global administrator.
+     * This is determined by the existence of their UID in the /roles_admin collection.
+     * This is a non-billable read.
+     */
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/roles_admin/$(request.auth.uid));
+    }
+
+    // ------------------------------------------------------------------------
+    // Collection Rules
+    // ------------------------------------------------------------------------
+
+    /**
+     * @description Defines admin user roles. This collection is managed server-side
+     *              (e.g., via the Firebase Console or Admin SDK) and should not be
+     *              writable by any client to prevent privilege escalation. Admins can
+     *              read the list of other admins.
+     * @path        /roles_admin/{uid}
+     * @allow       (get, list) An authenticated admin user.
+     * @deny        (any) An admin user attempting to write to this collection.
+     * @principle   Restricts modification of authorization roles to trusted server environments.
+     */
+    match /roles_admin/{uid} {
+      allow get: if isAdmin();
+      allow list: if isAdmin();
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    /**
+     * @description Stores website configuration settings. These settings can only be
+     *              read and modified by authenticated administrators.
+     * @path        /website_configuration/{configId}
+     * @allow       (get, list, create, update, delete) An authenticated admin user.
+     * @deny        (any) Any user who is not an administrator.
+     * @principle   Enforces global role-based access for critical configuration data.
+     */
+    match /website_configuration/{configId} {
+      allow get: if isAdmin();
+      allow list: if isAdmin();
+      allow create: if isAdmin();
+      allow update: if isAdmin() && resource != null;
+      allow delete: if isAdmin() && resource != null;
+    }
+
+    /**
+     * @description Stores contact form submissions from the website. Anyone can create
+     *              a submission, but only admins can read or delete them. Submissions
+     *              are immutable to preserve the original message.
+     * @path        /contact_form_submissions/{submissionId}
+     * @allow       (create) Any user, including unauthenticated visitors.
+     * @allow       (get, list, delete) An authenticated admin user.
+     * @deny        (update) Any user, to ensure submission integrity.
+     * @deny        (get, list, delete) A non-admin user.
+     * @principle   Provides a public write endpoint while securing read/delete access for admins.
+     */
+    match /contact_form_submissions/{submissionId} {
+      allow get: if isAdmin();
+      allow list: if isAdmin();
+      allow create: if true;
+      allow update: if false;
+      allow delete: if isAdmin() && resource != null;
+    }
+    
+    /**
+     * @description Stores page view analytics. Anyone can create an entry,
+     *              but only admins can read them. Documents are immutable.
+     * @path        /page_views/{viewId}
+     * @allow       (create) Any user, including unauthenticated visitors.
+     * @allow       (get, list, delete) An authenticated admin user.
+     * @deny        (update) Any user.
+     * @principle   Provides a public write endpoint for analytics while securing read access.
+     */
+    match /page_views/{viewId} {
+      allow get: if isAdmin();
+      allow list: if isAdmin();
+      allow create: if true;
+      allow update: if false;
+      allow delete: if isAdmin() && resource != null;
+    }
+  }
+}
